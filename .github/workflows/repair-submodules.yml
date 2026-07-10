@@ -1,0 +1,101 @@
+name: Repair missing submodules
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: repair-submodules-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: false
+          persist-credentials: true
+
+      - name: Restore exact pinned Git submodule entries
+        shell: bash
+        env:
+          MAGISK_BASE_COMMIT: c279e08c885bdf48dc86696f3f1093c02847a972
+        run: |
+          set -Eeuo pipefail
+
+          # The parent repository kept .gitmodules but lost the mode-160000
+          # gitlink entries. Read the exact 40-character object IDs from the
+          # matching historical Magisk tree and write those entries directly
+          # into this fork's index. No dependency checkout is needed here.
+          git remote remove magisk-base 2>/dev/null || true
+          git remote add magisk-base https://github.com/topjohnwu/Magisk.git
+          git fetch --no-tags --depth=1 magisk-base "$MAGISK_BASE_COMMIT"
+          base_tree="$(git rev-parse FETCH_HEAD)"
+
+          mapfile -t paths < <(
+            git config -f .gitmodules --get-regexp '^submodule\..*\.path$' |
+              awk '{ print $2 }'
+          )
+
+          if [[ "${#paths[@]}" -ne 16 ]]; then
+            echo "::error file=.gitmodules::Expected 16 submodule paths, found ${#paths[@]}"
+            exit 1
+          fi
+
+          for path in "${paths[@]}"; do
+            entry="$(git ls-tree "$base_tree" -- "$path")"
+            read -r mode type object recorded_path <<< "$entry"
+
+            if [[ "$mode" != 160000 || "$type" != commit || -z "$object" ]]; then
+              echo "::error::$path is not a submodule gitlink in Magisk $MAGISK_BASE_COMMIT"
+              exit 1
+            fi
+
+            echo "Restoring $path -> $object"
+            git rm -r --cached --ignore-unmatch -- "$path" >/dev/null 2>&1 || true
+            rm -rf -- "$path"
+            git update-index --add --cacheinfo 160000 "$object" "$path"
+          done
+
+          git add .gitmodules
+
+          echo 'Recorded gitlinks:'
+          git ls-files -s | awk '$1 == "160000" { print }'
+
+          count="$(git ls-files -s | awk '$1 == "160000" { n++ } END { print n+0 }')"
+          if [[ "$count" -ne 16 ]]; then
+            echo "::error::Expected 16 gitlinks, found $count"
+            exit 1
+          fi
+
+          # Confirm that every path in .gitmodules is now represented by a
+          # staged mode-160000 entry before creating the commit.
+          for path in "${paths[@]}"; do
+            mode="$(git ls-files -s -- "$path" | awk '{ print $1 }')"
+            if [[ "$mode" != 160000 ]]; then
+              echo "::error::$path was not recorded as a gitlink"
+              exit 1
+            fi
+          done
+
+      - name: Commit repaired submodules
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          if git diff --cached --quiet; then
+            echo 'Nothing changed; the submodule gitlinks are already present.'
+            exit 0
+          fi
+
+          git commit -m 'Restore pinned Magisk native submodules'
+          git push origin "HEAD:${GITHUB_REF_NAME}"
