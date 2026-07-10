@@ -1,98 +1,97 @@
-name: Magisk Build
+name: Build Magisk Delta
 
 on:
-  push:
-    branches: [ master ]
-    paths:
-      - 'app/**'
-      - 'native/**'
-      - 'stub/**'
-      - 'buildSrc/**'
-      - 'build.py'
-      - 'gradle.properties'
-      - '.github/workflows/build.yml'
-  pull_request:
-    branches: [ master ]
   workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: magiskdelta-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
-    name: Build on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ ubuntu-latest, windows-latest, macos-latest ]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
     env:
-      NDK_CCACHE: ccache
-      CCACHE_DIR: ${{ github.workspace }}/.ccache
-      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
-      RUSTC_WRAPPER: sccache
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
 
     steps:
-      - name: Check out
-        uses: actions/checkout@v3
+      - name: Checkout source and submodules
+        uses: actions/checkout@v6
         with:
-          submodules: 'recursive'
+          submodules: recursive
           fetch-depth: 0
 
+      - name: Verify required submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          while read -r _ path; do
+            if [[ ! -e "$path/.git" ]]; then
+              echo "::error file=.gitmodules::Missing submodule: $path"
+              missing=1
+            fi
+          done < <(git config -f .gitmodules --get-regexp '^submodule\..*\.path$')
+
+          if [[ "$missing" -ne 0 ]]; then
+            echo "This repository was probably created from a source ZIP."
+            echo "A ZIP does not preserve the pinned Git submodule entries."
+            exit 1
+          fi
+
+          git submodule status --recursive
+
       - name: Set up JDK 17
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v5
         with:
-          distribution: 'temurin'
+          distribution: temurin
           java-version: '17'
 
-      - name: Set up Python 3
-        uses: actions/setup-python@v4
+      - name: Set up Python
+        uses: actions/setup-python@v6
         with:
-          python-version: '3.x'
+          python-version: '3.11'
 
-      - name: Set up ccache
-        uses: hendrikmuhs/ccache-action@v1.2
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v6
         with:
-          key: ${{ runner.os }}-${{ github.sha }}
-          restore-keys: ${{ runner.os }}
+          cache-provider: basic
 
-      - name: Set up sccache
-        uses: hendrikmuhs/ccache-action@v1.2
-        with:
-          variant: sccache
-          key: ${{ runner.os }}-${{ github.sha }}
-          restore-keys: ${{ runner.os }}
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-33" \
+            "build-tools;33.0.1"
 
-      - name: Cache Gradle dependencies
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-            !~/.gradle/caches/build-cache-*
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle.kts') }}
-          restore-keys: ${{ runner.os }}-gradle-
+      - name: Prepare build scripts
+        run: chmod +x build.py gradlew
 
-      - name: Cache build cache
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.gradle/caches/build-cache-*
-          key: ${{ runner.os }}-build-cache-${{ github.sha }}
-          restore-keys: ${{ runner.os }}-build-cache-
-
-      - name: Set up NDK
+      - name: Download and install Magisk ONDK
         run: python build.py -v ndk
 
-      - name: Build release
-        run: |
-          python build.py -vr all
+      - name: Build release APK
+        run: python build.py -vr all
 
-      - name: Build debug
-        run: |
-          python build.py -v all
+      - name: Build debug APK
+        run: python build.py -v all
 
-      # Only upload artifacts built on Linux
-      - name: Upload build artifact
-        if: runner.os == 'Linux'
-        uses: actions/upload-artifact@v3
+      - name: Show outputs
+        run: find out -maxdepth 1 -type f -printf '%f  %s bytes\n' | sort
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v7
         with:
-          name: ${{ github.sha }}
-          path: out
+          name: magiskdelta-${{ github.sha }}
+          path: out/
+          if-no-files-found: error
+          compression-level: 9
