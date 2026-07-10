@@ -1,0 +1,108 @@
+name: Repair missing submodules
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: repair-submodules-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: false
+          persist-credentials: true
+
+      - name: Restore pinned Git submodule entries
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          # Pinned revisions taken from the Magisk source tree that matches
+          # this Magisk Delta 25.2-era codebase.
+          deps=(
+            'native/src/external/selinux|https://github.com/topjohnwu/selinux.git|d0f5823'
+            'native/src/external/busybox|https://github.com/topjohnwu/ndk-busybox.git|7236867'
+            'native/src/external/dtc|https://github.com/dgibson/dtc.git|c0c2e11'
+            'native/src/external/lz4|https://github.com/lz4/lz4.git|d443718'
+            'native/src/external/bzip2|https://github.com/nemequ/bzip2.git|67d8185'
+            'native/src/external/xz|https://github.com/xz-mirror/xz.git|2327a46'
+            'native/src/external/nanopb|https://github.com/nanopb/nanopb.git|c912413'
+            'native/src/external/mincrypt|https://github.com/topjohnwu/mincrypt.git|1f355c5'
+            'native/src/external/pcre|https://android.googlesource.com/platform/external/pcre|8e12681'
+            'native/src/external/libcxx|https://github.com/topjohnwu/libcxx.git|82090ae'
+            'native/src/external/zlib|https://android.googlesource.com/platform/external/zlib|3a0aa2b'
+            'native/src/external/parallel-hashmap|https://github.com/greg7mdp/parallel-hashmap.git|7684faf'
+            'native/src/external/zopfli|https://github.com/google/zopfli.git|831773b'
+            'native/src/external/cxx-rs|https://github.com/topjohnwu/cxx.git|d363e8e'
+            'native/src/external/lsplt|https://github.com/LSPosed/LSPlt.git|c202f29'
+            'tools/termux-elf-cleaner|https://github.com/termux/termux-elf-cleaner.git|9c739ff'
+          )
+
+          for item in "${deps[@]}"; do
+            IFS='|' read -r path url revision <<< "$item"
+            echo "::group::Restoring $path @ $revision"
+
+            git rm -r --cached --ignore-unmatch -- "$path" >/dev/null 2>&1 || true
+            rm -rf -- "$path"
+            mkdir -p -- "$(dirname "$path")"
+
+            # A complete history is intentionally used: the old pinned commit
+            # may not be the current branch tip and servers do not accept a
+            # fetch by abbreviated object ID reliably.
+            git clone --quiet --no-tags --no-checkout "$url" "$path"
+            git -C "$path" checkout --quiet --detach "$revision"
+
+            actual="$(git -C "$path" rev-parse HEAD)"
+            case "$actual" in
+              "$revision"*) ;;
+              *)
+                echo "::error::$path resolved to $actual instead of $revision"
+                exit 1
+                ;;
+            esac
+
+            # Adding a nested repository records a mode-160000 gitlink.
+            git add -- "$path"
+            echo "$path -> $actual"
+            echo "::endgroup::"
+          done
+
+          # Convert nested .git directories into normal submodule gitdirs.
+          git submodule absorbgitdirs
+          git add .gitmodules
+
+          echo 'Recorded gitlinks:'
+          git ls-files -s | awk '$1 == "160000" { print }'
+          count="$(git ls-files -s | awk '$1 == "160000" { n++ } END { print n+0 }')"
+          if [[ "$count" -ne 16 ]]; then
+            echo "::error::Expected 16 gitlinks, found $count"
+            exit 1
+          fi
+
+          git submodule status --recursive
+
+      - name: Commit repaired submodules
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          if git diff --cached --quiet; then
+            echo 'Nothing changed; the submodules are already repaired.'
+            exit 0
+          fi
+
+          git commit -m 'Restore pinned Magisk native submodules'
+          git push origin "HEAD:${GITHUB_REF_NAME}"
