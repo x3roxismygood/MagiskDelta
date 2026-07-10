@@ -101,6 +101,39 @@ jobs:
         shell: bash
         run: python build.py -v ndk
 
+      - name: Pin legacy cxxbridge dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cxx_dir="native/src/external/cxx-rs"
+          historical_lock="$cxx_dir/third-party/Cargo.lock"
+          workspace_lock="$cxx_dir/Cargo.lock"
+
+          test -f "$historical_lock"
+          cp "$historical_lock" "$workspace_lock"
+
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("build.py")
+          text = path.read_text(encoding="utf-8")
+
+          old = "cmds = [cargo, 'install', '--root', local_cargo_root, '--path', cxx_src]"
+          new = "cmds = [cargo, 'install', '--locked', '--root', local_cargo_root, '--path', cxx_src]"
+
+          if new in text:
+              print("build.py is already patched")
+          elif old in text:
+              path.write_text(text.replace(old, new, 1), encoding="utf-8")
+              print("Patched cargo install to use --locked")
+          else:
+              raise SystemExit("Could not find the cxxbridge cargo-install command in build.py")
+          PY
+
+          grep -n "cargo, 'install'.*--locked" build.py
+          grep -A4 -B2 'name = "quote"' "$workspace_lock" | head -20
+
       - name: Build release
         shell: bash
         run: python build.py -vr all
